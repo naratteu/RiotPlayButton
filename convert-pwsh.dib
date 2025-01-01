@@ -1,0 +1,128 @@
+#!meta
+
+{"kernelInfo":{"defaultKernelName":"csharp","items":[{"aliases":[],"languageName":"csharp","name":"csharp"}]}}
+
+#!pwsh
+
+dotnet build
+
+#!csharp
+
+#r "nuget: ICSharpCode.Decompiler, 9.0.0.7833-preview3"
+using System.IO;
+using System.Reflection.Metadata;
+using System.Reflection.PortableExecutable;
+using ICSharpCode.Decompiler;
+using ICSharpCode.Decompiler.CSharp;
+using ICSharpCode.Decompiler.Metadata;
+using ICSharpCode.Decompiler.TypeSystem;
+
+// https://github.com/icsharpcode/ILSpy/pull/3356
+
+static PEFile LoadPEFile(string fileName, DecompilerSettings settings)
+{
+    settings.LoadInMemory = true;
+    return new PEFile(
+        fileName,
+        new FileStream(fileName, FileMode.Open, FileAccess.Read),
+        streamOptions: PEStreamOptions.PrefetchEntireImage,
+        metadataOptions: settings.ApplyWindowsRuntimeProjections ? MetadataReaderOptions.ApplyWindowsRuntimeProjections : MetadataReaderOptions.None
+    );
+}
+
+static DecompilerTypeSystem CreateTypeSystemFromFile(string fileName, DecompilerSettings settings)
+{
+    settings.LoadInMemory = true;
+    var file = LoadPEFile(fileName, settings);
+    var resolver = new UniversalAssemblyResolver(fileName, settings.ThrowOnAssemblyResolveErrors,
+        file.DetectTargetFrameworkId(), file.DetectRuntimePack(),
+        settings.LoadInMemory ? PEStreamOptions.PrefetchMetadata : PEStreamOptions.Default,
+        settings.ApplyWindowsRuntimeProjections ? MetadataReaderOptions.ApplyWindowsRuntimeProjections : MetadataReaderOptions.None);
+    return new DecompilerTypeSystem(file, resolver, settings);
+}
+
+var setting = new DecompilerSettings
+{
+    ExtensionMethods = false,
+    AlwaysQualifyMemberReferences = true,
+    NamedArguments = false,
+};
+var decompile = new CSharpDecompiler(CreateTypeSystemFromFile("./bin/Debug/net6.0-windows/RiotPlayButton.dll", setting), setting);
+var comp = decompile.TypeSystem.MainModule.TopLevelTypeDefinitions.Single(t => t.Name is "RiotPlayButtonComponent");
+var code = decompile.DecompileTypeAsString(comp.FullTypeName);
+@$"```c#
+{code}
+```".DisplayAs("text/markdown");
+
+#!csharp
+
+#r "nuget: Microsoft.CodeAnalysis.CSharp, 4.12.0"
+using System.IO;
+using System.Text.RegularExpressions;
+using Microsoft.CodeAnalysis;
+using Microsoft.CodeAnalysis.CSharp;
+using Microsoft.CodeAnalysis.CSharp.Syntax;
+var root = CSharpSyntaxTree.ParseText(code).GetRoot() as CompilationUnitSyntax;
+using(var w = File.CreateText("./Components/RiotPlayButtonComponent.ps1"))
+{
+    foreach(var u in root.Usings)
+        if(Regex.Match(u.ToFullString(), @"using ([^=]+);").Groups is [_, var g])
+            w.WriteLine($"Using Namespace {g}");
+        else w.WriteLine($"#{u}");
+    IEnumerable<ClassDeclarationSyntax> Classs(SyntaxList<MemberDeclarationSyntax> list)
+    => from m in list let ss = m switch
+    {
+        BaseNamespaceDeclarationSyntax n => Classs(n.Members),
+        ClassDeclarationSyntax c => [c],
+    }
+    from s in ss select s;
+    foreach(var c in Classs(root.Members))
+    {
+        w.WriteLine($$"""Class {{c.Identifier}} {{c.BaseList}} {""");
+            foreach(var m in c.Members)
+            {
+                switch(m)
+                {
+                    case MethodDeclarationSyntax { Body: {} b } met: 
+                        var pp = string.Join(',',met.ParameterList.ChildNodes().Select(n => n is ParameterSyntax p ? $"[{p.Type}] {p.Identifier}" :""));
+                        w.WriteLine(Fix($"\t[{met.ReturnType}] {met.Identifier}({pp}) {b}"));
+                     break;
+                    case PropertyDeclarationSyntax { ExpressionBody: {} b } p:
+                        w.WriteLine($"\t[{p.Type}] ${p.Identifier} {b}".Replace("=>", "="));
+                     break;
+                    default: throw new();
+                }
+            }
+        w.WriteLine("}");
+    }
+}
+static string Repl(this string input, string pattern, string repl) => Regex.Replace(input, pattern, repl);
+static string Fix(string poststr) => poststr
+.Repl(@"(LinearGradientBrushExtention|Component|ColorHelper|ColorTranslator|ElementVisualExtention|ShapeVisualExtention|BorderVisualExtention|VisualExtention|VisualExtentions|BitmapScalingMode|FontWeights|Easing|UIElement|Cursors|System.Drawing.Color)\.", "[$1]::")
+.Repl("new (SolidColorBrush)", "[$1]::new")
+.Replace("[IVisual] Render()","[IElement] Render()")
+.Repl(@"var \((.+), (.+)\) = base\.UseState(.+);", "$1, $2 = base.UseState$3[0..1]")
+.Repl(@"UseState\(([0-9]+)\)", "UseState[int]($1)")
+.Repl(@"UseState\((true|false)\)", "UseState[bool](\x24$$1)")
+.Repl(@"default\(([^\)]+)\)", "[$1]::new()")
+.Repl("(num|action|flag|setIsHover|isToggle|setIsToggle)", "\x24script:$1")
+.Repl(@"delegate.*\r\n[ \t]+{", @"{ param($s, $e)")
+.Repl("(isHover|this|base|e.RoutedEvent)", "\x24$$1")
+.Repl(@"(\$script:[^\.]+)\(", "$1.Invoke(")
+.Replace(" == ", " -eq ")
+.Replace("$base", "$this")
+.Replace("Img(\"Resources/logo.png\")", $"Img(\"{Path.GetFullPath("./Resources/logo.png")}\")")
+.Repl(@"\[System.Windows.Media.Color\]::new\(\), 5\.0, 2\.0", "$0, 1.0, 315.0, [System.Windows.Media.Effects.RenderingBias]::Performance")
+.Replace("(!$script:isToggle) ? 100 : 0)", "(!$script:isToggle) ? 100 : 0, 0.001, 0.001)");
+
+#!pwsh
+
+pwsh -c @"
+`$_ = Install-Package DeltaMVU -v -Force -ProviderName Nuget -Scope CurrentUser
+`$_ = Add-Type -PassThru -AssemblyName ((Get-ChildItem -Recurse (Split-Path (Get-Package DeltaMVU).Source)).FullName |? {`$_ -like "*net8*.dll"})
+
+cat -raw './Components/RiotPlayButtonComponent.ps1' | iex
+`$w = New-Object System.Windows.Window -Property @{ Width = 320; Height = 240 }
+[ApplicationRoot]::Initialize([RiotPlayButtonComponent]::new(), `$w)
+[System.Windows.Application]::new().Run(`$w)
+"@
